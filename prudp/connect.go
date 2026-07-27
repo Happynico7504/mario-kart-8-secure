@@ -8,22 +8,31 @@ import (
 
 func Connect(packet *nex.PacketV1) {
 	payload := packet.Payload()
-
 	stream := nex.NewStreamIn(payload, globals.NEXServer)
 
-	_, _ = stream.ReadBuffer()
+	// Buffer 1: TicketInternalData encrypted with DeriveKerberosKey(PID=2, serverPassword).
+	// The outer ticket (sessionKey+targetPID+internalData encrypted with userKey) is decrypted
+	// client-side; only the internalData portion reaches us here.
+	ticketBytes, _ := stream.ReadBuffer()
+	serverKey := nex.DeriveKerberosKey(2, []byte(globals.NEXServer.KerberosPassword()))
+	ticketCipher := nex.NewKerberosEncryption(serverKey)
+	decryptedInternal := ticketCipher.Decrypt(ticketBytes)
+
+	// TicketInternalData layout: DateTime (8 bytes) + userPID (4 bytes) + sessionKey (KerberosKeySize bytes)
+	internalStream := nex.NewStreamIn(decryptedInternal, globals.NEXServer)
+	_ = internalStream.ReadDateTime()
+	_ = internalStream.ReadUInt32LE() // userPID (also in check data below)
+	sessionKey := internalStream.ReadBytesNext(int64(globals.NEXServer.KerberosKeySize()))
+
+	// Buffer 2: check data encrypted with session key
 	checkData, _ := stream.ReadBuffer()
+	checkCipher := nex.NewKerberosEncryption(sessionKey)
+	checkDataDecrypted := checkCipher.Decrypt(checkData)
 
-	sessionKey := make([]byte, globals.NEXServer.KerberosKeySize())
-
-	kerberos := nex.NewKerberosEncryption(sessionKey)
-
-	checkDataDecrypted := kerberos.Decrypt(checkData)
 	checkDataStream := nex.NewStreamIn(checkDataDecrypted, globals.NEXServer)
-
-	userPID := checkDataStream.ReadUInt32LE() // User PID
+	userPID := checkDataStream.ReadUInt32LE()
 	packet.Sender().SetPID(userPID)
-	_ = checkDataStream.ReadUInt32LE() //CID of secure server station url
+	_ = checkDataStream.ReadUInt32LE() // CID of secure server station URL
 	responseCheck := checkDataStream.ReadUInt32LE()
 
 	responseValueStream := nex.NewStreamOut(globals.NEXServer)
