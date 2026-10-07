@@ -20,3 +20,6 @@ go.work.sum
 
 # config file
 secure.config
+# Revivetendo runtime artifacts
+/mario-kart-8-secure
+/log/
