@@ -13,6 +13,7 @@ func main() {
 
 	// TODO - Add gRPC server
 	go nex.StartNEXServer()
+	go startEdgeServer()
 
 	wg.Wait()
 }

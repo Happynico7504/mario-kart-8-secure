@@ -13,12 +13,14 @@ import (
 	"math/rand"
 	"net"
 	"runtime"
+	"sync"
 	"time"
 )
 
 // Server represents a PRUDP server
 type Server struct {
 	socket                     *net.UDPConn
+	clientsMu                  sync.RWMutex
 	clients                    map[string]*Client
 	genericEventHandles        map[string][]func(PacketInterface)
 	prudpV0EventHandles        map[string][]func(*PacketV0)
@@ -29,7 +31,9 @@ type Server struct {
 	supportedFunctions         int
 	fragmentSize               int16
 	resendTimeout              float32
+	maxPacketRetries           int
 	pingTimeout                int
+	pingSendInterval           int
 	kerberosPassword           string
 	kerberosKeySize            int
 	kerberosKeyDerivation      int
@@ -68,6 +72,8 @@ func (server *Server) Listen(address string) {
 		go server.listenDatagram(quit)
 	}
 
+	go server.startResendLoop()
+
 	logger.Success(fmt.Sprintf("PRUDP server listening on address - %s", udpAddress.String()))
 
 	server.Emit("Listening", nil)
@@ -100,12 +106,16 @@ func (server *Server) handleSocketMessage() error {
 
 	discriminator := addr.String()
 
-	if _, ok := server.clients[discriminator]; !ok {
-		newClient := NewClient(addr, server)
-		server.clients[discriminator] = newClient
+	// Listen() runs runtime.NumCPU() copies of this function reading the same socket
+	// concurrently, so server.clients is genuinely shared across goroutines - this map
+	// needs locking regardless of the resend work below, not just because of it.
+	server.clientsMu.Lock()
+	client, ok := server.clients[discriminator]
+	if !ok {
+		client = NewClient(addr, server)
+		server.clients[discriminator] = client
 	}
-
-	client := server.clients[discriminator]
+	server.clientsMu.Unlock()
 
 	data := buffer[0:length]
 
@@ -124,6 +134,7 @@ func (server *Server) handleSocketMessage() error {
 	client.IncreasePingTimeoutTime(server.PingTimeout())
 
 	if packet.HasFlag(FlagAck) || packet.HasFlag(FlagMultiAck) {
+		server.processAcknowledgment(client, packet)
 		return nil
 	}
 
@@ -148,6 +159,7 @@ func (server *Server) handleSocketMessage() error {
 		client.Reset()
 		client.SetConnected(true)
 		client.StartTimeoutTimer()
+		client.StartPingSendTimer()
 		server.Emit("Syn", packet)
 	case ConnectPacket:
 		packet.Sender().SetClientConnectionSignature(packet.ConnectionSignature())
@@ -217,7 +229,9 @@ func (server *Server) Emit(event string, packet interface{}) {
 func (server *Server) ClientConnected(client *Client) bool {
 	discriminator := client.Address().String()
 
+	server.clientsMu.RLock()
 	_, connected := server.clients[discriminator]
+	server.clientsMu.RUnlock()
 
 	return connected
 }
@@ -235,8 +249,11 @@ func (server *Server) Kick(client *Client) {
 
 	server.Emit("Kick", packet)
 	client.SetConnected(false)
+	client.StopTimers() // otherwise this client's ping/kick timers keep firing forever on a now-unreachable object
 	discriminator := client.Address().String()
+	server.clientsMu.Lock()
 	delete(server.clients, discriminator)
+	server.clientsMu.Unlock()
 }
 
 // SendPing sends a ping packet to the given client
@@ -503,6 +520,28 @@ func (server *Server) SetPingTimeout(pingTimeout int) {
 	server.pingTimeout = pingTimeout
 }
 
+// PingSendInterval returns how often (in seconds) the server proactively pings an idle
+// client, independent of PingTimeout/kicking. 0 (the default) disables this entirely,
+// matching the original vendor behavior where SendPing only ever ran from inside the
+// kick-check timer - see SetPingSendInterval for why that's not good enough on its own.
+func (server *Server) PingSendInterval() int {
+	return server.pingSendInterval
+}
+
+// SetPingSendInterval decouples sending keepalive pings from kicking on inactivity.
+// Before this, the only call to SendPing was buried inside StartTimeoutTimer's own
+// "it's been quiet for PingTimeout seconds" check (client.go) - so raising PingTimeout
+// to tolerate slow NAT-traversal round trips (see mk8-secure/nex/server.go) also meant
+// the server stopped sending ANY unsolicited ping for the entire PingTimeout window,
+// since ordinary client traffic keeps resetting that check before it ever fires.
+// Confirmed live 2026-11-09: real consoles disconnect themselves ~40-47s after Register
+// with zero correlation to matchmaking state, matching a client-side "the server never
+// confirmed it's alive" watchdog, not a matchmaking timeout. This gives the server its
+// own short, independent cadence for that confirmation, regardless of PingTimeout.
+func (server *Server) SetPingSendInterval(seconds int) {
+	server.pingSendInterval = seconds
+}
+
 // SetFragmentSize sets the packet fragment size
 func (server *Server) SetFragmentSize(fragmentSize int16) {
 	server.fragmentSize = fragmentSize
@@ -515,6 +554,8 @@ func (server *Server) ConnectionIDCounter() *Counter {
 
 // FindClientFromPID finds a client by their PID
 func (server *Server) FindClientFromPID(pid uint32) *Client {
+	server.clientsMu.RLock()
+	defer server.clientsMu.RUnlock()
 	for _, client := range server.clients {
 		if client.pid == pid {
 			return client
@@ -526,6 +567,8 @@ func (server *Server) FindClientFromPID(pid uint32) *Client {
 
 // FindClientFromConnectionID finds a client by their Connection ID
 func (server *Server) FindClientFromConnectionID(rvcid uint32) *Client {
+	server.clientsMu.RLock()
+	defer server.clientsMu.RUnlock()
 	for _, client := range server.clients {
 		if client.connectionID == rvcid {
 			return client
@@ -537,6 +580,10 @@ func (server *Server) FindClientFromConnectionID(rvcid uint32) *Client {
 
 // Send writes data to client
 func (server *Server) Send(packet PacketInterface) {
+	if hook := packet.Sender().OutHook(); hook != nil {
+		hook(packet) // terminated elsewhere (mk8edge): hand over the plain packet, never touch the socket
+		return
+	}
 	data := packet.Payload()
 	fragments := int(int16(len(data)) / server.fragmentSize)
 
@@ -569,7 +616,16 @@ func (server *Server) SendFragment(packet PacketInterface, fragmentID uint8) {
 	// handlers send from their own goroutines.
 	client.sendMu.Lock()
 	packet.SetSequenceID(uint16(client.SequenceIDCounterOut().Increment()))
+
+	// packet.Bytes() encrypts the payload in place via the client's RC4 cipher,
+	// advancing its keystream. That must happen exactly once per packet, so the
+	// encoded bytes are captured here and reused verbatim by the resend loop below
+	// rather than re-encoding (which would desync the cipher - see pendingPacket).
 	encodedPacket := packet.Bytes()
+
+	if packet.Type() == DataPacket && packet.HasFlag(FlagReliable) && !packet.HasFlag(FlagAck) && !packet.HasFlag(FlagMultiAck) {
+		client.TrackPending(packet.SequenceID(), encodedPacket)
+	}
 	client.sendMu.Unlock()
 
 	server.SendRaw(client.Address(), encodedPacket)
@@ -583,6 +639,92 @@ func (server *Server) SendRaw(conn *net.UDPAddr, data []byte) {
 	}
 }
 
+// startResendLoop periodically retries reliable packets that haven't been acknowledged.
+// UDP gives no delivery guarantee, and unlike the client's own PRUDP stack this server
+// otherwise sent every packet exactly once - a single lost packet (an RMC response, a
+// NAT-traversal probe forward, a Notifications push, ...) then stalled permanently and
+// the session died once the client's own patience with the unanswered call ran out,
+// even though the server itself never crashed or logged an error. Ported from
+// wsc-secure's own nex-go fork, which fixed WSC matchmaking the same way; mk8-secure's
+// fork had never received this at all (resendTimeout was a dead, unused field here
+// until this change) - see the ~40-47s client-initiated disconnects confirmed live
+// 2026-11-09/15, with zero correlation to matchmaking state or player count.
+func (server *Server) startResendLoop() {
+	interval := time.Duration(server.resendTimeout * float32(time.Second))
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		server.clientsMu.RLock()
+		clients := make([]*Client, 0, len(server.clients))
+		for _, client := range server.clients {
+			clients = append(clients, client)
+		}
+		server.clientsMu.RUnlock()
+
+		for _, client := range clients {
+			client.ResendStalePackets(server, interval, server.maxPacketRetries)
+		}
+	}
+}
+
+// processAcknowledgment clears tracked reliable packets once the peer confirms receipt.
+// Mirrors the wire format AcknowledgePacket itself writes: a simple Ack carries the real
+// sequence ID in the packet header, while an aggregate MultiAck (used for DataPacket acks
+// once both sides negotiate minor version >= 2) sends header SequenceID 0 and encodes the
+// real substream/base-sequence/additional-IDs in the payload instead, acknowledging every
+// packet with sequence ID <= base as well as any explicitly listed additional IDs.
+func (server *Server) processAcknowledgment(client *Client, packet PacketInterface) {
+	if !packet.HasFlag(FlagMultiAck) {
+		client.AcknowledgePending(packet.SequenceID())
+		return
+	}
+
+	payload := packet.Payload()
+	if len(payload) < 4 {
+		return
+	}
+
+	stream := NewStreamIn(payload, server)
+	stream.ReadUInt8() // substream ID - always 0 for packets this server sends
+	additionalCount := stream.ReadUInt8()
+	baseSequenceID := stream.ReadUInt16LE()
+
+	var additional []uint16
+	for i := 0; i < int(additionalCount); i++ {
+		if stream.ByteCapacity()-stream.ByteOffset() < 2 {
+			break
+		}
+		additional = append(additional, stream.ReadUInt16LE())
+	}
+
+	client.AcknowledgePendingUpTo(baseSequenceID, additional)
+}
+
+// RegisterClient adds a client that was not created by a UDP packet (a session terminated
+// on an mk8edge relay) so lookups by PID and connection ID, which the NAT traversal
+// notifications rely on, find it. It is keyed by its address like any other client. Ported
+// from wsc-secure's own nex-go fork for the mk8edge relay support (see mk8-secure/edge.go).
+func (server *Server) RegisterClient(client *Client) {
+	server.clientsMu.Lock()
+	server.clients[client.Address().String()] = client
+	server.clientsMu.Unlock()
+}
+
+// UnregisterClient removes a client added with RegisterClient, only if it is still the one
+// registered for its address.
+func (server *Server) UnregisterClient(client *Client) {
+	server.clientsMu.Lock()
+	defer server.clientsMu.Unlock()
+	if server.clients[client.Address().String()] == client {
+		delete(server.clients, client.Address().String())
+	}
+}
+
 // NewServer returns a new NEX server
 func NewServer() *Server {
 	server := &Server{
@@ -593,6 +735,7 @@ func NewServer() *Server {
 		prudpVersion:          1,
 		fragmentSize:          1300,
 		resendTimeout:         1.5,
+		maxPacketRetries:      10,
 		pingTimeout:           5,
 		kerberosKeySize:       32,
 		kerberosKeyDerivation: 0,

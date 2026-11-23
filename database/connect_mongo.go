@@ -21,6 +21,7 @@ var usersCollection *mongo.Collection
 var sessionsCollection *mongo.Collection
 var roomsCollection *mongo.Collection
 var tourneysCollection *mongo.Collection
+var roomHistoryCollection *mongo.Collection
 
 func connectMongo() {
 	if globals.Config.DatabaseUseAuth {
@@ -41,6 +42,10 @@ func connectMongo() {
 	sessionsCollection = mk8Database.Collection(globals.Config.SessionsCollection)
 	roomsCollection = mk8Database.Collection(globals.Config.RoomsCollection)
 	tourneysCollection = mk8Database.Collection(globals.Config.TournamentsCollection)
+	// Deliberately NOT wiped below like sessions/rooms - this is a persistent record of
+	// past rooms (room_history, mirroring wsc-secure's match_history) meant to survive
+	// restarts, unlike in-memory-only connection state which is genuinely gone on restart.
+	roomHistoryCollection = mk8Database.Collection(globals.Config.RoomHistoryCollection)
 
 	sessionsCollection.DeleteMany(context.TODO(), bson.D{})
 	roomsCollection.DeleteMany(context.TODO(), bson.D{})

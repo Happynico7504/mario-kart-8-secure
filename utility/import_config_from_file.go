@@ -99,6 +99,9 @@ func ImportConfigFromFile(path string) (*types.ServerConfig, error) {
 		case "TournamentsCollection":
 			config.TournamentsCollection = index[1]
 			break
+		case "RoomHistoryCollection":
+			config.RoomHistoryCollection = index[1]
+			break
 		default:
 			break
 		}

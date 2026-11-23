@@ -1,7 +1,7 @@
 package nex
 
 import (
-	"reflect"
+	"errors"
 	"strings"
 	"time"
 )
@@ -49,12 +49,16 @@ func NewData() *Data {
 	return data
 }
 
-var dataHolderKnownObjects = make(map[string]StructureInterface)
+var dataHolderKnownObjects = make(map[string]func() StructureInterface)
 
-// RegisterDataHolderType registers a structure to be a valid type in the DataHolder structure
-func RegisterDataHolderType(structure StructureInterface) {
-	name := reflect.TypeOf(structure).Elem().Name()
-	dataHolderKnownObjects[name] = structure
+// RegisterDataHolderType registers a factory for a valid type in the DataHolder structure,
+// keyed by the structure's own type name (e.g. "MatchmakeSession"). The factory must build
+// the instance through the structure's own constructor (NewXxx()), not reflect.New: a type
+// with embedded pointer fields set up by its constructor (MatchmakeSession's *Gathering,
+// used by its generated Hierarchy() method) is left nil by a bare zero-value, which panics
+// as soon as ExtractFromStream touches it.
+func RegisterDataHolderType(name string, factory func() StructureInterface) {
+	dataHolderKnownObjects[name] = factory
 }
 
 // DataHolder represents a structure which can hold any other structure
@@ -92,9 +96,12 @@ func (dataHolder *DataHolder) ExtractFromStream(stream *StreamIn) error {
 	dataHolder.length1 = stream.ReadUInt32LE()
 	dataHolder.length2 = stream.ReadUInt32LE()
 
-	newObjectInstance := reflect.New(reflect.TypeOf(dataHolderKnownObjects[dataHolder.typeName]).Elem()).Interface().(StructureInterface)
+	factory, ok := dataHolderKnownObjects[dataHolder.typeName]
+	if !ok {
+		return errors.New("[DataHolder] unregistered type: " + dataHolder.typeName)
+	}
 
-	dataHolder.objectData, _ = stream.ReadStructure(newObjectInstance)
+	dataHolder.objectData, _ = stream.ReadStructure(factory())
 
 	return nil
 }

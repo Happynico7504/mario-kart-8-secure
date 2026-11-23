@@ -159,6 +159,13 @@ func (packet *Packet) RMCRequest() RMCRequest {
 	return packet.rmcRequest
 }
 
+// SetRMCRequest attaches an already-parsed request, for packets that did not arrive over
+// this server's socket (see Client.SetOutHook / mk8-secure/edge.go's handleEdgeRMC). Ported
+// from wsc-secure's own nex-go fork for the mk8edge relay support.
+func (packet *Packet) SetRMCRequest(request RMCRequest) {
+	packet.rmcRequest = request
+}
+
 // NewPacket returns a new PRUDP packet generic
 func NewPacket(client *Client, data []byte) Packet {
 	packet := Packet{

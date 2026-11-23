@@ -1,7 +1,9 @@
 package nex_secure_connection
 
 import (
+	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/PretendoNetwork/mario-kart-8-secure/database"
 	"github.com/PretendoNetwork/mario-kart-8-secure/globals"
@@ -10,6 +12,10 @@ import (
 )
 
 func Register(err error, client *nex.Client, callID uint32, stationUrls []*nex.StationURL) {
+	fmt.Printf("Register: PID=%d oldConnectionID=%d existingSession=%v\n", client.PID(), client.ConnectionID(), database.DoesSessionExist(client.PID()))
+	if _, already := globals.ConnectedPIDs.Load(client.PID()); !already {
+		globals.ConnectedPIDs.Store(client.PID(), time.Now())
+	}
 	localStation := stationUrls[0]
 	localStationURL := localStation.EncodeToString()
 	connectionId := uint32(globals.NEXServer.ConnectionIDCounter().Increment())
@@ -22,6 +28,23 @@ func Register(err error, client *nex.Client, callID uint32, stationUrls []*nex.S
 	natm := "0"
 	type_ := "3"
 
+	// Consoles call Register more than once per logical connection (periodic
+	// re-registration), and this handler used to always reset natm/natf to "0" -
+	// silently wiping whatever ReportNATProperties had already stamped onto this
+	// PID's station URLs, so the partner's later probe used stale/default NAT info.
+	// Preserve any already-stamped natm/natf from the existing session's type-3 URL.
+	sessionExists := database.DoesSessionExist(client.PID())
+	if sessionExists {
+		for _, oldURLString := range database.GetPlayerURLs(client.PID()) {
+			oldURL := nex.NewStationURL(oldURLString)
+			if oldURL.Type() == "3" && (oldURL.Natm() != "" && oldURL.Natm() != "0" || oldURL.Natf() != "" && oldURL.Natf() != "0") {
+				natm = oldURL.Natm()
+				natf = oldURL.Natf()
+				break
+			}
+		}
+	}
+
 	localStation.SetAddress(address)
 	localStation.SetPort(port)
 	localStation.SetNatf(natf)
@@ -30,7 +53,7 @@ func Register(err error, client *nex.Client, callID uint32, stationUrls []*nex.S
 
 	globalStationURL := localStation.EncodeToString()
 
-	if !database.DoesSessionExist(client.PID()) {
+	if !sessionExists {
 		database.AddPlayerSession(client.PID(), []string{localStationURL, globalStationURL}, address, port)
 	} else {
 		database.UpdatePlayerSessionAll(client.PID(), []string{localStationURL, globalStationURL}, address, port)

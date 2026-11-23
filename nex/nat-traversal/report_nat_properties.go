@@ -1,6 +1,7 @@
 package nex_nat_traversal
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/PretendoNetwork/mario-kart-8-secure/database"
@@ -10,6 +11,7 @@ import (
 )
 
 func ReportNATProperties(err error, client *nex.Client, callID uint32, natm uint32, natf uint32, rtt uint32) {
+	fmt.Printf("ReportNATProperties: PID=%d connectionID=%d natm=%d natf=%d rtt=%d\n", client.PID(), client.ConnectionID(), natm, natf, rtt)
 	stationUrlsStrings := database.GetPlayerURLs(client.PID())
 	stationUrls := make([]nex.StationURL, len(stationUrlsStrings))
 	pid := strconv.FormatUint(uint64(client.PID()), 10)
@@ -27,6 +29,7 @@ func ReportNATProperties(err error, client *nex.Client, callID uint32, natm uint
 		stationUrls[i].SetRVCID(rvcid)
 		database.UpdatePlayerSessionURL(client.PID(), stationUrlsStrings[i], stationUrls[i].EncodeToString())
 	}
+	fmt.Printf("ReportNATProperties: PID=%d stamped urls=%v\n", client.PID(), database.GetPlayerURLs(client.PID()))
 
 	rmcResponse := nex.NewRMCResponse(nat_traversal.ProtocolID, callID)
 	rmcResponse.SetSuccess(nat_traversal.MethodReportNATProperties, nil)

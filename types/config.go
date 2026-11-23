@@ -22,4 +22,5 @@ type ServerConfig struct {
 	UsersCollection       string
 	RegionsCollection     string
 	TournamentsCollection string
+	RoomHistoryCollection string
 }

@@ -2,6 +2,7 @@ package nex
 
 import (
 	"crypto/rc4"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -31,7 +32,50 @@ type Client struct {
 	connectionID              uint32
 	pingCheckTimer            *time.Timer
 	pingKickTimer             *time.Timer
+	pingSendTimer             *time.Timer
 	connected                 bool
+	outHook                   func(packet PacketInterface)
+	pendingMu                 sync.Mutex
+	pendingPackets            map[uint16]*pendingPacket
+	rttSmoothed               time.Duration // smoothed ack round trip time (RFC 6298 style, alpha 1/8)
+	rttMin                    time.Duration
+	rttSamples                int
+}
+
+// pendingPacket is a reliable packet awaiting acknowledgement. data holds the already
+// RC4-encrypted, fully encoded wire bytes - resends must reuse them as-is via SendRaw,
+// never re-run Bytes(), since re-encoding a DataPacket advances the RC4 keystream again
+// and would desync the cipher from what the client expects. Ported from wsc-secure's
+// own nex-go fork (confirmed live fix there) after finding mk8-secure's server never
+// retransmitted anything it sent - a single lost reliable packet (an RMC response, a
+// NAT-traversal probe forward, the join-notification push, ...) stalled permanently
+// with no server-side error, until the client's own patience with the unanswered call
+// ran out and it disconnected itself - independent of matchmaking state or player
+// count, matching the ~40-47s disconnects confirmed live 2026-11-09/15.
+type pendingPacket struct {
+	data    []byte
+	sentAt  time.Time
+	first   time.Time // first transmission (sentAt moves with every resend)
+	retries int
+}
+
+// SetOutHook diverts everything the server would send to this client. The hook gets each
+// packet BEFORE fragmentation and encryption, so a data packet's payload is the plain RMC
+// message. It is for sessions whose PRUDP connection is terminated elsewhere (an mk8edge
+// relay): those clients have no UDP socket, cipher or resend state here. nil restores
+// normal sending. Ported from wsc-secure's own nex-go fork for the mk8edge relay support
+// (see mk8-secure/edge.go) - this project's vendor otherwise has no edge-related patches.
+func (client *Client) SetOutHook(hook func(packet PacketInterface)) {
+	client.mu.Lock()
+	client.outHook = hook
+	client.mu.Unlock()
+}
+
+// OutHook returns the hook set by SetOutHook, or nil.
+func (client *Client) OutHook() func(packet PacketInterface) {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	return client.outHook
 }
 
 // Reset resets the Client to default values
@@ -51,6 +95,126 @@ func (client *Client) Reset() {
 	}
 
 	client.SetConnected(false)
+
+	client.pendingMu.Lock()
+	client.pendingPackets = make(map[uint16]*pendingPacket)
+	client.pendingMu.Unlock()
+}
+
+// TrackPending registers an already-encoded reliable packet for retransmission until
+// it is acknowledged or exceeds its retry budget.
+func (client *Client) TrackPending(sequenceID uint16, data []byte) {
+	client.pendingMu.Lock()
+	defer client.pendingMu.Unlock()
+
+	if client.pendingPackets == nil {
+		client.pendingPackets = make(map[uint16]*pendingPacket)
+	}
+
+	now := time.Now()
+	client.pendingPackets[sequenceID] = &pendingPacket{data: data, sentAt: now, first: now}
+}
+
+// PendingStats describes the reliable packets this server sent the client that it has not
+// acknowledged yet: how many, how long the oldest has waited and the most resends of any.
+func (client *Client) PendingStats() (count int, oldest time.Duration, maxRetries int) {
+	client.pendingMu.Lock()
+	defer client.pendingMu.Unlock()
+	now := time.Now()
+	for _, p := range client.pendingPackets {
+		count++
+		if age := now.Sub(p.first); age > oldest {
+			oldest = age
+		}
+		if p.retries > maxRetries {
+			maxRetries = p.retries
+		}
+	}
+	return
+}
+
+// AcknowledgePending removes a single tracked packet, identified by the sequence ID
+// carried in a simple (non-aggregate) Ack packet's header.
+func (client *Client) AcknowledgePending(sequenceID uint16) {
+	client.pendingMu.Lock()
+	defer client.pendingMu.Unlock()
+
+	client.sampleRTTLocked(sequenceID)
+	delete(client.pendingPackets, sequenceID)
+}
+
+// sampleRTTLocked records the round trip of an acknowledged packet. A packet that was ever
+// retransmitted is skipped: the ack could belong to either transmission (Karn's rule).
+// Caller holds pendingMu.
+func (client *Client) sampleRTTLocked(sequenceID uint16) {
+	p, ok := client.pendingPackets[sequenceID]
+	if !ok || p.retries != 0 {
+		return
+	}
+	sample := time.Since(p.sentAt)
+	if client.rttSamples == 0 {
+		client.rttSmoothed, client.rttMin = sample, sample
+	} else {
+		client.rttSmoothed += (sample - client.rttSmoothed) / 8
+		if sample < client.rttMin {
+			client.rttMin = sample
+		}
+	}
+	client.rttSamples++
+}
+
+// RTT reports the smoothed and minimum round trip time between sending a reliable packet
+// and receiving its acknowledgement, and how many samples that rests on (0 = none yet).
+func (client *Client) RTT() (smoothed, min time.Duration, samples int) {
+	client.pendingMu.Lock()
+	defer client.pendingMu.Unlock()
+	return client.rttSmoothed, client.rttMin, client.rttSamples
+}
+
+// AcknowledgePendingUpTo removes every tracked packet whose sequence ID is <= base
+// (the cumulative-ack semantics PRUDP's aggregate MultiAck uses), plus any additional
+// sequence IDs listed explicitly for selective acknowledgement of out-of-order packets.
+func (client *Client) AcknowledgePendingUpTo(base uint16, additional []uint16) {
+	client.pendingMu.Lock()
+	defer client.pendingMu.Unlock()
+
+	client.sampleRTTLocked(base)
+	for seq := range client.pendingPackets {
+		if seq <= base {
+			delete(client.pendingPackets, seq)
+		}
+	}
+
+	for _, seq := range additional {
+		delete(client.pendingPackets, seq)
+	}
+}
+
+// ResendStalePackets resends any tracked packet that has been unacknowledged for at
+// least timeout, dropping it once it has been retried maxRetries times. Packets are
+// resent verbatim via SendRaw - see the pendingPacket doc comment for why.
+func (client *Client) ResendStalePackets(server *Server, timeout time.Duration, maxRetries int) {
+	now := time.Now()
+
+	client.pendingMu.Lock()
+	var toResend [][]byte
+	for seq, p := range client.pendingPackets {
+		if now.Sub(p.sentAt) < timeout {
+			continue
+		}
+		if p.retries >= maxRetries {
+			delete(client.pendingPackets, seq)
+			continue
+		}
+		p.retries++
+		p.sentAt = now
+		toResend = append(toResend, p.data)
+	}
+	client.pendingMu.Unlock()
+
+	for _, data := range toResend {
+		server.SendRaw(client.Address(), data)
+	}
 }
 
 // Address returns the clients UDP address
@@ -196,6 +360,7 @@ func (client *Client) SetConnected(connected bool) {
 
 // IncreasePingTimeoutTime adds a number of seconds to the check timer
 func (client *Client) IncreasePingTimeoutTime(seconds int) {
+	fmt.Printf("DIAG IncreasePingTimeoutTime: PID=%d seconds=%d hasKickTimer=%v hasCheckTimer=%v\n", client.pid, seconds, client.pingKickTimer != nil, client.pingCheckTimer != nil)
 	//Stop the kick timer if we get something back
 	if client.pingKickTimer != nil {
 		client.pingKickTimer.Stop()
@@ -208,14 +373,55 @@ func (client *Client) IncreasePingTimeoutTime(seconds int) {
 
 // StartTimeoutTimer begins the packet timeout timer
 func (client *Client) StartTimeoutTimer() {
+	timeout := client.server.PingTimeout()
+	fmt.Printf("DIAG StartTimeoutTimer: PID=%d pingTimeout=%d\n", client.pid, timeout)
 	//if we haven't gotten a ping *from* the client, send them one to check all is well
-	client.pingCheckTimer = time.AfterFunc(time.Second*time.Duration(client.server.PingTimeout()), func() {
+	client.pingCheckTimer = time.AfterFunc(time.Second*time.Duration(timeout), func() {
+		fmt.Printf("DIAG pingCheckTimer fired, sending ping: PID=%d\n", client.pid)
 		client.server.SendPing(client)
 		//if we *still* get nothing, they're gone
-		client.pingKickTimer = time.AfterFunc(time.Second*time.Duration(client.server.PingTimeout()), func() {
+		kickTimeout := client.server.PingTimeout()
+		fmt.Printf("DIAG scheduling pingKickTimer: PID=%d pingTimeout=%d\n", client.pid, kickTimeout)
+		client.pingKickTimer = time.AfterFunc(time.Second*time.Duration(kickTimeout), func() {
+			fmt.Printf("DIAG pingKickTimer fired, kicking: PID=%d\n", client.pid)
 			client.server.Kick(client)
 		})
 	})
+}
+
+// StartPingSendTimer begins a repeating, self-rescheduling ping on
+// server.PingSendInterval(), independent of StartTimeoutTimer's kick-check cycle. A
+// no-op if the interval is unset (0), preserving old behavior for anything that never
+// calls SetPingSendInterval. See SetPingSendInterval's comment for why this exists
+// separately from the kick timer instead of just lowering PingTimeout back down.
+func (client *Client) StartPingSendTimer() {
+	interval := client.server.PingSendInterval()
+	if interval <= 0 {
+		return
+	}
+
+	client.pingSendTimer = time.AfterFunc(time.Second*time.Duration(interval), func() {
+		if !client.connected {
+			return
+		}
+		client.server.SendPing(client)
+		client.StartPingSendTimer() // reschedule - time.Timer doesn't repeat on its own
+	})
+}
+
+// StopTimers cancels every per-client timer (ping-send, ping-check, ping-kick) so a
+// kicked or disconnected client's goroutines don't keep firing against an object
+// nothing can reach anymore.
+func (client *Client) StopTimers() {
+	if client.pingSendTimer != nil {
+		client.pingSendTimer.Stop()
+	}
+	if client.pingCheckTimer != nil {
+		client.pingCheckTimer.Stop()
+	}
+	if client.pingKickTimer != nil {
+		client.pingKickTimer.Stop()
+	}
 }
 
 // NewClient returns a new PRUDP client

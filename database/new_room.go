@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"math/rand"
+	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -36,7 +37,8 @@ func NewRoom(host uint32, gamemode uint32, public bool, region uint32, gameconfi
 		{"region", region},
 		{"gameconfig", gameconfig},
 		{"player_count", int64(0)},
-		{"dlc_mode", dlcmode}}
+		{"dlc_mode", dlcmode},
+		{"created_at", time.Now()}}
 	_, err := roomsCollection.InsertOne(context.TODO(), gatheringDoc)
 	if err != nil {
 		panic(err)

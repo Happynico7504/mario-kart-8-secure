@@ -2,6 +2,7 @@ package nex
 
 import (
 	"github.com/PretendoNetwork/mario-kart-8-secure/globals"
+	"github.com/PretendoNetwork/nex-go"
 	match_making "github.com/PretendoNetwork/nex-protocols-go/match-making"
 	match_making_ext "github.com/PretendoNetwork/nex-protocols-go/match-making-ext"
 	matchmake_extension "github.com/PretendoNetwork/nex-protocols-go/matchmake-extension"
@@ -18,6 +19,15 @@ import (
 )
 
 func registerNEXProtocols() {
+	// AutoMatchmakeWithSearchCriteria_Postpone's anyGathering parameter is a DataHolder;
+	// nex-go's DataHolder.ExtractFromStream needs a factory registered for the type name
+	// the client sends ("MatchmakeSession", per the handler's response which writes that
+	// same string back) so it can build a properly-constructed instance - NewMatchmakeSession()
+	// wires up the embedded *Gathering its generated Hierarchy() method needs.
+	nex.RegisterDataHolderType("MatchmakeSession", func() nex.StructureInterface {
+		return match_making.NewMatchmakeSession()
+	})
+
 	secureConnectionProtocol := secure_connection.NewSecureConnectionProtocol(globals.NEXServer)
 
 	secureConnectionProtocol.Register(nex_secure_connection.Register)
@@ -28,6 +38,7 @@ func registerNEXProtocols() {
 
 	natTraversalProtocol.RequestProbeInitiationExt(nex_nat_traversal.RequestProbeInitiationExt)
 	natTraversalProtocol.ReportNATProperties(nex_nat_traversal.ReportNATProperties)
+	natTraversalProtocol.ReportNATTraversalResult(nex_nat_traversal.ReportNATTraversalResult)
 
 	matchmakeExtensionProtocol := matchmake_extension.NewMatchmakeExtensionProtocol(globals.NEXServer)
 
